@@ -1,6 +1,8 @@
 import json
 import time
 
+import re
+
 def normalize_label(label):
     """라벨 정규화: '+', 'cross' -> 'Cross', 'x' -> 'X'"""
     if not label:
@@ -92,6 +94,20 @@ def mode_1_user_input():
     else:
         print("판정: 필터 B (X 등)")
 
+def _get_ci(d, name):
+    """딕셔너리에서 대소문자 무시하고 키 찾기"""
+    if not isinstance(d, dict):
+        return None
+    for k, v in d.items():
+        if str(k).strip().lower() == name:
+            return v
+    return None
+
+def _extract_size(key):
+    """'size_5', '5', '5x5' 등에서 첫 숫자를 크기로 추출"""
+    m = re.search(r"\d+", str(key))
+    return int(m.group()) if m else None
+
 def mode_2_json_analysis():
     print("\n#----------------------------------------")
     print("# [1] 필터 로드")
@@ -102,117 +118,117 @@ def mode_2_json_analysis():
     except FileNotFoundError:
         print("오류: data.json 파일을 찾을 수 없습니다. 파일을 같은 디렉토리에 위치시켜 주세요.")
         return
+    except json.JSONDecodeError as e:
+        print(f"오류: data.json 형식이 올바르지 않습니다. ({e})")
+        return
 
-    filters_raw = data.get("filters", {})
-    patterns_raw = data.get("patterns", {})
-    
+    filters_raw = _get_ci(data, "filters") or {}
+    patterns_raw = _get_ci(data, "patterns") or {}
+
+    # 필터 로드: 크기(int) -> {"Cross": mat, "X": mat}
     loaded_filters = {}
     for f_key, f_data in filters_raw.items():
-        # f_key 예: "size_5", "size_13", "size_25"
-        loaded_filters[f_key] = {}
-        for sub_k, sub_mat in f_data.items():
-            std_sub_k = normalize_label(sub_k)
-            loaded_filters[f_key][std_sub_k] = sub_mat
-        print(f"✓ {f_key:<8} 필터 로드 완료 (Cross, X)")
+        size = _extract_size(f_key)
+        if size is None or not isinstance(f_data, dict):
+            continue
+        loaded_filters[size] = {normalize_label(k): v for k, v in f_data.items()}
+        print(f"✓ {str(f_key):<8} 필터 로드 완료 ({', '.join(loaded_filters[size].keys())})")
+
+    # 패턴을 (키, 정보) 리스트로 통일 (dict / list 모두 지원)
+    if isinstance(patterns_raw, dict):
+        pattern_items = list(patterns_raw.items())
+    elif isinstance(patterns_raw, list):
+        pattern_items = [
+            (str(p.get("id") or p.get("name") or f"pattern_{i+1}"), p)
+            for i, p in enumerate(patterns_raw) if isinstance(p, dict)
+        ]
+    else:
+        pattern_items = []
+
+    # 테스트가 0개면 성공으로 처리하지 않고 원인 안내
+    if not pattern_items or not loaded_filters:
+        print("\n오류: 분석할 데이터를 읽지 못했습니다.")
+        print(f"- 최상위 키: {list(data.keys()) if isinstance(data, dict) else type(data).__name__}")
+        print(f"- 로드된 필터 수: {len(loaded_filters)}, 패턴 수: {len(pattern_items)}")
+        print("data.json의 'filters' / 'patterns' 구조를 확인해주세요.")
+        return
 
     print("\n#----------------------------------------")
     print("# [2] 패턴 분석 (라벨 정규화 적용)")
     print("#----------------------------------------")
-    
+
     total_tests = 0
     passed_tests = 0
     failed_tests = 0
     failure_records = []
-    
     epsilon = 1e-9
 
-    for p_key, p_info in patterns_raw.items():
+    for p_key, p_info in pattern_items:
         total_tests += 1
-        pattern_mat = p_info.get("input")
-        raw_expected = p_info.get("expected")
+        pattern_mat = (p_info.get("input") or p_info.get("pattern")
+                       or p_info.get("matrix"))
+        raw_expected = p_info.get("expected", p_info.get("label"))
         expected = normalize_label(raw_expected)
-        
-        # 키에서 크기 추출 (예: size_5_1 -> size_5)
-        parts = p_key.split("_")
-        if len(parts) >= 2:
-            size_str = f"size_{parts[1]}"
-        else:
-            size_str = "size_5"
-            
-        target_filters = loaded_filters.get(size_str, {})
-        cross_filter = target_filters.get("Cross")
-        x_filter = target_filters.get("X")
-        
-        # 스키마 및 크기 검증
-        if not cross_filter or not x_filter or not pattern_mat:
+
+        print(f"--- {p_key} ---")
+
+        def fail(reason):
+            nonlocal failed_tests
             failed_tests += 1
-            reason = "스키마 불일치 또는 필터 데이터 누락"
             failure_records.append((p_key, reason))
-            print(f"--- {p_key} ---")
             print(f"판정: FAIL | 사유: {reason}")
-            continue
-            
-        # 크기 일치 검증
-        p_rows = len(pattern_mat)
-        f_rows = len(cross_filter)
-        if p_rows != f_rows:
-            failed_tests += 1
-            reason = f"크기 불일치 (패턴 행:{p_rows} != 필터 행:{f_rows})"
-            failure_records.append((p_key, reason))
-            print(f"--- {p_key} ---")
-            print(f"판정: FAIL | 사유: {reason}")
+
+        if not pattern_mat:
+            fail("패턴 데이터 누락")
             continue
 
-        # MAC 연산 수행
+        size = len(pattern_mat)
+        target = loaded_filters.get(size, {})
+        cross_filter = target.get("Cross")
+        x_filter = target.get("X")
+
+        if not cross_filter or not x_filter:
+            fail(f"{size}x{size} 필터 데이터 누락")
+            continue
+        if any(len(row) != size for row in pattern_mat) or \
+           len(cross_filter) != size or len(x_filter) != size:
+            fail("크기 불일치")
+            continue
+
         score_cross = mac_operation(pattern_mat, cross_filter)
         score_x = mac_operation(pattern_mat, x_filter)
-        
-        # 판정 결정
+
         if abs(score_cross - score_x) < epsilon:
             pred = "UNDECIDED"
         elif score_cross > score_x:
             pred = "Cross"
         else:
             pred = "X"
-            
-        # PASS/FAIL 비교 판단
-        if pred == "UNDECIDED":
-            is_pass = False
-            reason = "동점(UNDECIDED) 처리 규칙에 따라 FAIL"
-        elif pred == expected:
-            is_pass = True
-            reason = "정상 통과"
-        else:
-            is_pass = False
-            reason = f"예측값({pred})과 기대값({expected}) 불일치"
-            
-        if is_pass:
-            passed_tests += 1
-            status_str = "PASS"
-        else:
-            failed_tests += 1
-            status_str = f"FAIL ({reason})"
-            failure_records.append((p_key, reason))
-            
-        print(f"--- {p_key} ---")
+
         print(f"Cross 점수: {score_cross}")
         print(f"X 점수: {score_x}")
-        print(f"판정: {pred} | expected: {expected} | {status_str}")
+
+        if pred == "UNDECIDED":
+            passed_str = "FAIL (동점 UNDECIDED)"
+            failed_tests += 1
+            failure_records.append((p_key, "동점(UNDECIDED) 처리 규칙에 따라 FAIL"))
+        elif pred == expected:
+            passed_str = "PASS"
+            passed_tests += 1
+        else:
+            passed_str = f"FAIL (예측 {pred} != 기대 {expected})"
+            failed_tests += 1
+            failure_records.append((p_key, f"예측값({pred})과 기대값({expected}) 불일치"))
+        print(f"판정: {pred} | expected: {expected} | {passed_str}")
 
     print("\n#----------------------------------------")
     print("# [3] 성능 분석 (평균/10회)")
     print("#----------------------------------------")
-    sizes_to_test = [3, 5, 13, 25]
-    perf_results = []
-    for s in sizes_to_test:
-        avg_t = measure_performance(s, 10)
-        ops_count = s * s
-        perf_results.append((s, avg_t, ops_count))
-        
     print(f"{'크기':<10} {'평균 시간(ms)':<15} {'연산 횟수'}")
     print("-" * 40)
-    for s, t, ops in perf_results:
-        print(f"{s}×{s:<8} {t:<15.3f} {ops}")
+    for s in [3, 5, 13, 25]:
+        t = measure_performance(s, 10)
+        print(f"{str(s)+'x'+str(s):<10} {t:<15.3f} {s*s}")
 
     print("\n#----------------------------------------")
     print("# [4] 결과 요약")
@@ -220,7 +236,7 @@ def mode_2_json_analysis():
     print(f"총 테스트: {total_tests}개")
     print(f"통과: {passed_tests}개")
     print(f"실패: {failed_tests}개")
-    
+
     if failure_records:
         print("\n실패 케이스:")
         for k, r in failure_records:
